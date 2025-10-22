@@ -42,6 +42,7 @@ A production-grade Bash script that automates the complete setup, deployment, an
 - Bash 4.0 or higher
 - Git installed
 - SSH client
+- `fzf` (optional, for interactive branch selection)
 - Network connectivity to remote server
 
 ### Remote Server Requirements

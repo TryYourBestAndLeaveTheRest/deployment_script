@@ -157,6 +157,106 @@ validate_file_exists() {
     return 0
 }
 
+# Install fzf if not present
+install_fzf() {
+    show_progress "Attempting to install fzf..."
+    local pkg_manager=""
+
+    # Detect package manager
+    if command -v apt-get &> /dev/null; then
+        pkg_manager="apt-get"
+    elif command -v yum &> /dev/null; then
+        pkg_manager="yum"
+    elif command -v dnf &> /dev/null; then
+        pkg_manager="dnf"
+    elif command -v pacman &> /dev/null; then
+        pkg_manager="pacman"
+    elif command -v brew &> /dev/null; then
+        pkg_manager="brew"
+    else
+        log_error "Could not detect a supported package manager (apt, yum, dnf, pacman, brew) to install fzf."
+        log_info "Please install fzf manually: https://github.com/junegunn/fzf#installation"
+        return 1
+    fi
+
+    log_info "Using ${pkg_manager} to install fzf..."
+    if [[ "${pkg_manager}" == "pacman" ]]; then
+        sudo "${pkg_manager}" -S --noconfirm fzf
+    else
+        sudo "${pkg_manager}" install -y fzf
+    fi
+
+    if command -v fzf &> /dev/null; then
+        log_success "fzf installed successfully."
+    else
+        log_error "fzf installation failed. Please try installing it manually."
+        return 1
+    fi
+}
+
+# Array to hold remote branches
+REMOTE_BRANCHES=()
+
+# Fetch remote branches using PAT (tries git ls-remote first, then GitHub API as fallback)
+fetch_remote_branches() {
+    local repo_url="$1"
+    local pat="$2"
+    REMOTE_BRANCHES=()
+
+    # Only proceed for https urls
+    if [[ ! "${repo_url}" =~ ^https?:// ]]; then
+        log_info "Branch auto-discovery only supported for HTTPS repos. Skipping."
+        return 0
+    fi
+
+    show_progress "Discovering remote branches for repository..."
+
+    # Try using git ls-remote with temporary auth URL
+    mkdir -p "${TEMP_DIR}"
+    local auth_url
+    auth_url=$(echo "${repo_url}" | sed "s|https://|https://${pat}@|")
+    # Use a subshell to avoid polluting cwd
+    if git ls-remote --heads "${auth_url}" 2>>"${LOG_FILE}" | awk '{print $2}' | sed 's#refs/heads/##' | sort -u > "${TEMP_DIR}/branches.txt" 2>>"${LOG_FILE}"; then
+        mapfile -t REMOTE_BRANCHES < "${TEMP_DIR}/branches.txt"
+    fi
+
+    # If empty and looks like GitHub, use API as fallback (PAT required)
+    if [[ ${#REMOTE_BRANCHES[@]} -eq 0 ]] && [[ "${repo_url}" =~ github.com ]]; then
+        if [[ -z "${pat}" ]]; then
+            log_info "No PAT provided; cannot query GitHub API for branches."
+            return 0
+        fi
+        # Extract owner/repo
+        local owner_repo
+        owner_repo=$(echo "${repo_url}" | sed -E 's#https?://github.com/##' | sed -E 's#(.*/.*)\.git#\1#')
+        if [[ -n "${owner_repo}" ]]; then
+            local page=1
+            while : ; do
+                local api_url="https://api.github.com/repos/${owner_repo}/branches?per_page=100&page=${page}"
+                # Use curl with PAT
+                local result
+                result=$(curl -s -H "Authorization: token ${pat}" "${api_url}")
+                # Break if empty or not json
+                if [[ -z "${result}" ]] || [[ "${result}" == "[]" ]]; then
+                    break
+                fi
+                # Parse branch names
+                echo "${result}" | grep -oP '"name":\s*"\K[^"]+' >> "${TEMP_DIR}/branches_api.txt" 2>>"${LOG_FILE}"
+                ((page++))
+            done
+            if [[ -f "${TEMP_DIR}/branches_api.txt" ]]; then
+                mapfile -t REMOTE_BRANCHES < "${TEMP_DIR}/branches_api.txt"
+            fi
+        fi
+    fi
+
+    if [[ ${#REMOTE_BRANCHES[@]} -gt 0 ]]; then
+        log_success "Found ${#REMOTE_BRANCHES[@]} branches"
+    else
+        log_info "No remote branches discovered"
+    fi
+}
+
 ################################################################################
 # User Input Collection Functions
 ################################################################################
@@ -210,6 +310,15 @@ prompt_input() {
 # Collect all required parameters
 collect_parameters() {
     show_progress "Collecting deployment parameters..."
+
+    # Check for fzf and offer to install it
+    if ! command -v fzf &> /dev/null; then
+        log_warning "fzf (fuzzy finder) is not installed. It provides a better interactive experience for branch selection."
+        read -p "Would you like to try and install it now? (yes/no): " -r install_fzf_confirm
+        if [[ "${install_fzf_confirm}" =~ ^[Yy][Ee][Ss]$ ]]; then
+            install_fzf
+        fi
+    fi
     
     echo ""
     echo -e "${CYAN}========================================${NC}"
@@ -220,7 +329,34 @@ collect_parameters() {
     # Git repository details
     prompt_input "Git Repository URL" GIT_REPO_URL "" false validate_git_url
     prompt_input "Personal Access Token (PAT)" GIT_PAT "" true
-    prompt_input "Branch name" GIT_BRANCH "main" false
+
+    # If PAT and repo provided, try to fetch branches and present a selector
+    fetch_remote_branches "${GIT_REPO_URL}" "${GIT_PAT}"
+    if [[ ${#REMOTE_BRANCHES[@]} -gt 0 ]]; then
+        # If fzf is available, use it for interactive selection
+        if command -v fzf &> /dev/null; then
+            echo -e "\nAvailable branches (use up/down or type to filter, Enter to select):"
+            GIT_BRANCH=$(printf "%s\n" "${REMOTE_BRANCHES[@]}" | fzf --height 10 --reverse) || true
+        else
+            # Fallback to numbered select menu
+            echo -e "\nAvailable branches:"
+            select b in "${REMOTE_BRANCHES[@]}"; do
+                if [[ -n "$b" ]]; then
+                    GIT_BRANCH="$b"
+                    break
+                else
+                    echo "Invalid selection. Try again."
+                fi
+            done
+        fi
+        # If selection empty, default to main
+        if [[ -z "${GIT_BRANCH:-}" ]]; then
+            log_warning "No branch selected; defaulting to 'main'"
+            GIT_BRANCH="main"
+        fi
+    else
+        prompt_input "Branch name" GIT_BRANCH "main" false
+    fi
     
     # SSH details
     echo ""
